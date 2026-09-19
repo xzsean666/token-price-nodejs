@@ -1,3 +1,4 @@
+import zlib from "node:zlib";
 import type { ArchiveProviderAdapter } from "./ArchiveProviderAdapter";
 import type { KlinePoint } from "../domain/klineModels";
 
@@ -76,17 +77,7 @@ function extractSingleFileFromZip(buf: Buffer | Uint8Array): string {
   }
 
   if (compMethod === 8) {
-    // Try node:zlib synchronously
-    if (typeof process !== "undefined" && process.versions?.node) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const zlib = require("node:zlib");
-        return zlib.inflateRawSync(compressedData).toString("utf-8");
-      } catch {
-        // Continue
-      }
-    }
-    throw new Error("Synchronous deflate decompression requires Node.js zlib.");
+    return zlib.inflateRawSync(compressedData).toString("utf-8");
   } else if (compMethod === 0) {
     // Stored (no compression)
     return new TextDecoder("utf-8").decode(compressedData);

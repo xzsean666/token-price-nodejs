@@ -1,3 +1,4 @@
+import zlib from "node:zlib";
 import type { ArchiveProviderAdapter } from "./ArchiveProviderAdapter";
 import type { KlinePoint } from "../domain/klineModels";
 
@@ -14,18 +15,7 @@ export class GateArchiveAdapter implements ArchiveProviderAdapter {
   }
 
   parseArchive(rawData: Buffer | Uint8Array, interval: string): KlinePoint[] {
-    let decompressed: string;
-    if (typeof process !== "undefined" && process.versions?.node) {
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const zlib = require("node:zlib");
-        decompressed = zlib.gunzipSync(rawData).toString("utf-8");
-      } catch (err) {
-        throw new Error(`Failed to gunzip Gate archive: ${err}`);
-      }
-    } else {
-      throw new Error("Synchronous gunzip decompression requires Node.js zlib.");
-    }
+    const decompressed = zlib.gunzipSync(rawData).toString("utf-8");
 
     const lines = decompressed.split("\n");
     const points: KlinePoint[] = [];

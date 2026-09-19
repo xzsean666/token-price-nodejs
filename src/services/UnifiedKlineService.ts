@@ -22,8 +22,8 @@ export class UnifiedKlineService {
   constructor(
     private readonly tokenSupport: TokenSupportService,
     private readonly archiveManager: KlineArchiveManager,
-    private readonly binanceAdapter: BinanceAdapter | null = null,
-    private readonly gateAdapter: GateAdapter | null = null,
+    private readonly binanceAdapter: any = null,
+    private readonly gateAdapter: any = null,
     options: UnifiedKlineServiceOptions = {},
   ) {
     this.transport = options.transport ?? new AxiosHttpTransport();

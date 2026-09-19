@@ -42,7 +42,7 @@ export class PriceSyncService {
 
   constructor(
     storage: PriceStorage | PriceSyncStoreInterface | GenericSqlExecutor,
-    private readonly binance: BinanceAdapter,
+    private readonly binance: any,
     private readonly aliases: Readonly<Record<string, string>> = {},
     private readonly dailyAdapters: ReadonlyMap<string, TokenPriceProviderAdapter> = new Map(),
   ) {

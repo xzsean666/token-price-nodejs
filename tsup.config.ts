@@ -11,5 +11,5 @@ export default defineConfig({
   target: "es2022",
   treeshake: true,
   minify: false,
-  external: ["axios", "zod", "node:sqlite", "node:fs", "node:path", "node:crypto"],
+  external: ["axios", "zod", "node:sqlite", "node:fs", "node:path", "node:crypto", "node:zlib", "node:module"],
 });

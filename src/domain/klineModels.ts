@@ -1,21 +1,21 @@
 import { tokenPriceError } from "./errors";
 
-export type KlineInterval =
-  | "1m"
-  | "3m"
-  | "5m"
-  | "15m"
-  | "30m"
-  | "1h"
-  | "2h"
-  | "4h"
-  | "6h"
-  | "8h"
-  | "12h"
-  | "1d"
-  | "3d"
-  | "1w"
-  | "1M";
+export const KLINE_INTERVALS = [
+  "1m",
+  "3m",
+  "5m",
+  "15m",
+  "30m",
+  "1h",
+  "2h",
+  "4h",
+  "6h",
+  "8h",
+  "12h",
+  "1d",
+] as const;
+
+export type KlineInterval = (typeof KLINE_INTERVALS)[number];
 
 export interface KlinePoint {
   readonly timestamp: number; // Unix milliseconds
