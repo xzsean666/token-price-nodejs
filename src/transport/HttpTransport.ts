@@ -69,7 +69,14 @@ export class HttpTransportError extends Error {
 }
 
 export function isHttpTransportError(value: unknown): value is HttpTransportError {
-  return value instanceof HttpTransportError;
+  return (
+    value instanceof HttpTransportError ||
+    (typeof value === "object" &&
+      value !== null &&
+      "code" in value &&
+      "retryable" in value &&
+      (value as any).name === "HttpTransportError")
+  );
 }
 
 export function parseHttpProxyUrl(rawUrl: string): HttpProxy {

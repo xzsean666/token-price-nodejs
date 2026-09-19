@@ -1,4 +1,5 @@
-import { TokenPriceError } from "../domain/errors";
+import { TokenPriceError, isTokenPriceError } from "../domain/errors";
+import { isHttpTransportError } from "../transport/HttpTransport";
 import type {
   TokenPriceAggregationResult,
   TokenPriceProviderFailure,
@@ -216,7 +217,15 @@ function defaultUuid(): string {
 
 function normalizeAttemptFailure(error: unknown, provider: string, signal: AbortSignal | undefined): TokenPriceError {
   if (signal?.aborted === true) return callerAborted(provider);
-  if (error instanceof TokenPriceError) return error;
+  if (isTokenPriceError(error)) return error;
+  if (isHttpTransportError(error)) {
+    return new TokenPriceError({
+      code: error.code as any,
+      message: "Token price HTTP request failed.",
+      retryable: error.retryable,
+      provider,
+    });
+  }
   return new TokenPriceError({
     code: "PROVIDER_UNAVAILABLE",
     message: "Token price provider request failed.",

@@ -53,6 +53,17 @@ export class TokenPriceError extends Error {
 // Backwards compatibility alias for EVM Data SDK consumers
 export { TokenPriceError as EvmDataError };
 
+export function isTokenPriceError(value: unknown): value is TokenPriceError {
+  return (
+    value instanceof TokenPriceError ||
+    (typeof value === "object" &&
+      value !== null &&
+      "code" in value &&
+      "retryable" in value &&
+      ((value as any).name === "TokenPriceError" || (value as any).name === "EvmDataError"))
+  );
+}
+
 export function tokenPriceError(
   code: TokenPriceErrorCode,
   message: string,
