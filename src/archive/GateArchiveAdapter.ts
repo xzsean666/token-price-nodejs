@@ -1,6 +1,6 @@
-import zlib from "node:zlib";
 import type { ArchiveProviderAdapter } from "./ArchiveProviderAdapter";
 import type { KlinePoint } from "../domain/klineModels";
+import { decompressGzip } from "../transport/decompression";
 
 export class GateArchiveAdapter implements ArchiveProviderAdapter {
   readonly provider = "gate" as const;
@@ -14,8 +14,9 @@ export class GateArchiveAdapter implements ArchiveProviderAdapter {
     return `https://download.gatedata.org/spot/candlesticks_${interval}/${yyyymm}/${pair}-${yyyymm}.csv.gz`;
   }
 
-  parseArchive(rawData: Buffer | Uint8Array, interval: string): KlinePoint[] {
-    const decompressed = zlib.gunzipSync(rawData).toString("utf-8");
+  async parseArchive(rawData: Buffer | Uint8Array, interval: string): Promise<KlinePoint[]> {
+    const decompressedBytes = await decompressGzip(rawData);
+    const decompressed = new TextDecoder("utf-8").decode(decompressedBytes);
 
     const lines = decompressed.split("\n");
     const points: KlinePoint[] = [];

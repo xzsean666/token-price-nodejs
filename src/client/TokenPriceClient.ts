@@ -94,6 +94,7 @@ export class TokenPriceClient {
     this.klineArchiveManager = new KlineArchiveManager({
       cacheDir: options.cacheDir,
       storage: this.storage,
+      transport,
     });
     this.unifiedKlineService = new UnifiedKlineService(
       this.tokenSupportService,

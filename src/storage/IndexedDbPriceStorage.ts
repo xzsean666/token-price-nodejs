@@ -271,39 +271,44 @@ export class IndexedDbPriceStorage implements PriceStorage {
           try {
             const tx = db.transaction("price_points", "readonly");
             const store = tx.objectStore("price_points");
-            const index = store.index("scope_timestamp");
-
-            let range: IDBKeyRange;
-            let cursorDir: IDBCursorDirection;
-
             if (scopeKey) {
-              if (direction === "before") {
-                range = IDBKeyRange.bound([scopeKey, ""], [scopeKey, requestedIso]);
-                cursorDir = "prev";
-              } else {
-                range = IDBKeyRange.bound([scopeKey, requestedIso], [scopeKey, "\uffff"]);
-                cursorDir = "next";
-              }
-            } else {
-              // Prefix search on tokenKey: iterates cursor until matching token prefix
-              const tokenPrefix = `${params.tokenKey}:`;
-              if (direction === "before") {
-                range = IDBKeyRange.bound([tokenPrefix, ""], [`${tokenPrefix}\uffff`, requestedIso]);
-                cursorDir = "prev";
-              } else {
-                range = IDBKeyRange.bound([tokenPrefix, requestedIso], [`${tokenPrefix}\uffff`, "\uffff"]);
-                cursorDir = "next";
-              }
-            }
+              const index = store.index("scope_timestamp");
+              const range =
+                direction === "before"
+                  ? IDBKeyRange.bound([scopeKey, ""], [scopeKey, requestedIso])
+                  : IDBKeyRange.bound([scopeKey, requestedIso], [scopeKey, "\uffff"]);
+              const cursorDir = direction === "before" ? "prev" : "next";
 
-            const req = index.openCursor(range, cursorDir);
-            req.onsuccess = () => {
-              const cursor = req.result;
-              if (!cursor) return resolve(null);
-              const val = cursor.value as PricePointRecord;
-              resolve(val);
-            };
-            req.onerror = () => resolve(null);
+              const req = index.openCursor(range, cursorDir);
+              req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) return resolve(null);
+                resolve(cursor.value as PricePointRecord);
+              };
+              req.onerror = () => resolve(null);
+            } else {
+              // Prefix search on tokenKey across scopes: search timestamp index
+              const index = store.index("timestamp");
+              const tokenPrefix = `${params.tokenKey}:`;
+              const range =
+                direction === "before"
+                  ? IDBKeyRange.upperBound(requestedIso)
+                  : IDBKeyRange.lowerBound(requestedIso);
+              const cursorDir = direction === "before" ? "prev" : "next";
+
+              const req = index.openCursor(range, cursorDir);
+              req.onsuccess = () => {
+                const cursor = req.result;
+                if (!cursor) return resolve(null);
+                const val = cursor.value as PricePointRecord;
+                if (val.scope_key.startsWith(tokenPrefix)) {
+                  resolve(val);
+                } else {
+                  cursor.continue();
+                }
+              };
+              req.onerror = () => resolve(null);
+            }
           } catch {
             resolve(null);
           }

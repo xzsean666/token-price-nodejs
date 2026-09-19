@@ -1,5 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
 import axios from "axios";
 import type { KlinePoint } from "../domain/klineModels";
 import { KlineBinaryCodec } from "./KlineBinaryCodec";
@@ -8,12 +6,14 @@ import { BinanceArchiveAdapter } from "./BinanceArchiveAdapter";
 import { GateArchiveAdapter } from "./GateArchiveAdapter";
 import { TokenPriceError } from "../domain/errors";
 import type { PriceStorage } from "../storage/PriceStorage";
+import type { HttpTransport } from "../transport/HttpTransport";
 
 export interface KlineArchiveManagerOptions {
   readonly cacheDir?: string | undefined;
   readonly ttlMs?: number | undefined; // Default: 24h = 86_400_000 ms
   readonly storage?: PriceStorage | null | undefined;
   readonly axiosInstance?: any | undefined;
+  readonly transport?: HttpTransport | undefined;
 }
 
 class AsyncLock {
@@ -26,11 +26,31 @@ class AsyncLock {
   }
 }
 
+let nodeFsModule: typeof import("node:fs") | null = null;
+let nodePathModule: typeof import("node:path") | null = null;
+
+async function getNodeFs(): Promise<{ fs: typeof import("node:fs"); path: typeof import("node:path") } | null> {
+  if (typeof process === "undefined" || !process.versions?.node) {
+    return null;
+  }
+  if (!nodeFsModule || !nodePathModule) {
+    try {
+      const [fs, path] = await Promise.all([import("node:fs"), import("node:path")]);
+      nodeFsModule = (fs as any).default ?? fs;
+      nodePathModule = (path as any).default ?? path;
+    } catch {
+      return null;
+    }
+  }
+  return { fs: nodeFsModule!, path: nodePathModule! };
+}
+
 export class KlineArchiveManager {
   private readonly cacheDir: string | null;
   private readonly ttlMs: number;
   private readonly storage: PriceStorage | null;
   private readonly axiosClient: typeof axios;
+  private readonly transport: HttpTransport | null;
   private readonly lock = new AsyncLock();
   private readonly adapters = new Map<"binance" | "gate", ArchiveProviderAdapter>([
     ["binance", new BinanceArchiveAdapter()],
@@ -42,6 +62,7 @@ export class KlineArchiveManager {
     this.ttlMs = options.ttlMs ?? 86_400_000; // 1 day
     this.storage = options.storage ?? null;
     this.axiosClient = options.axiosInstance ?? axios;
+    this.transport = options.transport ?? null;
   }
 
   /**
@@ -100,12 +121,26 @@ export class KlineArchiveManager {
       const url = adapter.getMonthlyArchiveUrl(baseSymbol, interval, year, month);
       let rawBuffer: Uint8Array;
       try {
-        const res = await this.axiosClient.get(url, {
-          responseType: "arraybuffer",
-          timeout: 60_000,
-          ...(signal === undefined ? {} : { signal }),
-        });
-        rawBuffer = new Uint8Array(res.data);
+        if (this.transport) {
+          const res = await this.transport.request<ArrayBuffer | Uint8Array>({
+            method: "GET",
+            url,
+            responseType: "arraybuffer",
+            timeoutMs: 60_000,
+            ...(signal === undefined ? {} : { signal }),
+          });
+          if (res.status !== 200 || !res.body) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+          rawBuffer = res.body instanceof Uint8Array ? res.body : new Uint8Array(res.body);
+        } else {
+          const res = await this.axiosClient.get(url, {
+            responseType: "arraybuffer",
+            timeout: 60_000,
+            ...(signal === undefined ? {} : { signal }),
+          });
+          rawBuffer = res.data instanceof Uint8Array ? res.data : new Uint8Array(res.data);
+        }
       } catch (error: any) {
         if (signal?.aborted) {
           throw new TokenPriceError({
@@ -125,7 +160,7 @@ export class KlineArchiveManager {
       }
 
       // Parse and normalize into points
-      const points = adapter.parseArchive(rawBuffer, interval);
+      const points = await adapter.parseArchive(rawBuffer, interval);
 
       // Encode to compact 16-byte fixed-length binary
       const binaryData = KlineBinaryCodec.encode(points);
@@ -133,8 +168,8 @@ export class KlineArchiveManager {
       // Write to cache
       await this.writeCache(cacheKey, binaryData);
 
-      // Clean expired files
-      this.cleanExpiredCache();
+      // Clean expired files (fire and forget)
+      this.cleanExpiredCache().catch(() => undefined);
 
       return KlineBinaryCodec.decode(binaryData, startMs, endMs);
     });
@@ -142,13 +177,14 @@ export class KlineArchiveManager {
 
   private async readCache(cacheKey: string): Promise<Uint8Array | null> {
     // 1. Try disk cache if in Node.js
-    if (this.cacheDir && typeof process !== "undefined" && process.versions?.node) {
+    const nodeFs = await getNodeFs();
+    if (this.cacheDir && nodeFs) {
       try {
-        const filePath = path.join(this.cacheDir, `${cacheKey}.bin`);
-        if (fs.existsSync(filePath)) {
-          const stat = fs.statSync(filePath);
+        const filePath = nodeFs.path.join(this.cacheDir, `${cacheKey}.bin`);
+        if (nodeFs.fs.existsSync(filePath)) {
+          const stat = nodeFs.fs.statSync(filePath);
           if (Date.now() - stat.mtimeMs < this.ttlMs) {
-            const buf = fs.readFileSync(filePath);
+            const buf = nodeFs.fs.readFileSync(filePath);
             return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
           }
         }
@@ -166,11 +202,12 @@ export class KlineArchiveManager {
   }
 
   private async writeCache(cacheKey: string, data: Uint8Array): Promise<void> {
-    if (this.cacheDir && typeof process !== "undefined" && process.versions?.node) {
+    const nodeFs = await getNodeFs();
+    if (this.cacheDir && nodeFs) {
       try {
-        const filePath = path.join(this.cacheDir, `${cacheKey}.bin`);
-        fs.mkdirSync(path.dirname(filePath), { recursive: true });
-        fs.writeFileSync(filePath, data);
+        const filePath = nodeFs.path.join(this.cacheDir, `${cacheKey}.bin`);
+        nodeFs.fs.mkdirSync(nodeFs.path.dirname(filePath), { recursive: true });
+        nodeFs.fs.writeFileSync(filePath, data);
       } catch {
         // Disk write failure non-fatal
       }
@@ -184,11 +221,12 @@ export class KlineArchiveManager {
   /**
    * Cleans up cache files older than TTL (24 hours).
    */
-  cleanExpiredCache(): void {
-    if (this.cacheDir && typeof process !== "undefined" && process.versions?.node) {
+  async cleanExpiredCache(): Promise<void> {
+    const nodeFs = await getNodeFs();
+    if (this.cacheDir && nodeFs) {
       try {
-        if (fs.existsSync(this.cacheDir)) {
-          cleanDir(this.cacheDir, Date.now(), this.ttlMs);
+        if (nodeFs.fs.existsSync(this.cacheDir)) {
+          cleanDir(nodeFs.fs, nodeFs.path, this.cacheDir, Date.now(), this.ttlMs);
         }
       } catch {
         // Ignore
@@ -196,17 +234,17 @@ export class KlineArchiveManager {
     }
 
     if (this.storage) {
-      this.storage.archiveCache.cleanExpired(this.ttlMs).catch(() => undefined);
+      await this.storage.archiveCache.cleanExpired(this.ttlMs).catch(() => undefined);
     }
   }
 }
 
-function cleanDir(dir: string, now: number, ttlMs: number): void {
+function cleanDir(fs: typeof import("node:fs"), path: typeof import("node:path"), dir: string, now: number, ttlMs: number): void {
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      cleanDir(fullPath, now, ttlMs);
+      cleanDir(fs, path, fullPath, now, ttlMs);
       try {
         if (fs.readdirSync(fullPath).length === 0) {
           fs.rmdirSync(fullPath);

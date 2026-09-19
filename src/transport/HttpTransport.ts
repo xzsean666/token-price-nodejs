@@ -93,5 +93,5 @@ export function parseHttpProxyUrl(rawUrl: string): HttpProxy {
 }
 
 export interface HttpTransport {
-  request(request: HttpRequest): Promise<HttpResponse<any>>;
+  request<T = any>(request: HttpRequest): Promise<HttpResponse<T>>;
 }

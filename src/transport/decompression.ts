@@ -15,8 +15,8 @@ export async function decompressGzip(data: Uint8Array | ArrayBuffer): Promise<Ui
       const response = new Response(ds.readable);
       const arrayBuffer = await response.arrayBuffer();
       return new Uint8Array(arrayBuffer);
-    } catch (error) {
-      throw tokenPriceError("PROVIDER_UNAVAILABLE", "Failed to decompress gzip stream.", { cause: error });
+    } catch {
+      // Continue to node:zlib fallback
     }
   }
 
@@ -66,9 +66,20 @@ export async function decompressZipSingleFile(data: Uint8Array | ArrayBuffer): P
 
   // If compression method is 8 (Deflate)
   if (compressionMethod === 8) {
-    const compressedData = compressedSize > 0
-      ? bytes.subarray(dataOffset, dataOffset + compressedSize)
-      : bytes.subarray(dataOffset);
+    let compressedData: Uint8Array;
+    if (compressedSize > 0) {
+      compressedData = bytes.subarray(dataOffset, dataOffset + compressedSize);
+    } else {
+      // If compressed size is 0 in local header, extract until central directory signature 0x02014b50
+      let centralIdx = -1;
+      for (let i = dataOffset; i < bytes.length - 4; i++) {
+        if (bytes[i] === 0x50 && bytes[i + 1] === 0x4b && bytes[i + 2] === 0x01 && bytes[i + 3] === 0x02) {
+          centralIdx = i;
+          break;
+        }
+      }
+      compressedData = centralIdx !== -1 ? bytes.subarray(dataOffset, centralIdx) : bytes.subarray(dataOffset);
+    }
 
     if (typeof DecompressionStream !== "undefined") {
       try {

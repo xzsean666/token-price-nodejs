@@ -17,5 +17,5 @@ export interface ArchiveProviderAdapter {
    * @param rawData Raw downloaded buffer (ZIP or GZ)
    * @param interval Kline interval
    */
-  parseArchive(rawData: Buffer | Uint8Array, interval: string): KlinePoint[];
+  parseArchive(rawData: Buffer | Uint8Array, interval: string): Promise<KlinePoint[]> | KlinePoint[];
 }

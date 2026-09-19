@@ -86,8 +86,8 @@ export class KlineBinaryCodec {
 }
 
 function formatPrice(value: number): string {
-  if (!Number.isFinite(value) || value < 0) return "0";
+  if (!Number.isFinite(value) || value <= 0) return "0";
   const str = String(value);
   if (!str.includes("e") && !str.includes("E")) return str;
-  return value.toFixed(8).replace(/\.?0+$/, "");
+  return value.toFixed(18).replace(/\.?0+$/, "");
 }
