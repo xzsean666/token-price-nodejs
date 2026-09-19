@@ -23,6 +23,8 @@ export interface BinanceKlinePoint {
   readonly priceUsd: string;
 }
 
+export type BinanceFiveMinuteKlinePoint = BinanceKlinePoint;
+
 export interface BinanceFiveMinuteKlineRequest {
   readonly symbol: string;
   readonly start: number | string | Date;
