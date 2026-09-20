@@ -22,6 +22,7 @@ export interface QueryPointParams {
   readonly timestamp: string; // ISO string
   readonly direction: "before" | "after" | "nearest";
   readonly maxDistanceMs?: number | undefined;
+  readonly interval?: string | null | undefined;
 }
 
 export interface QueryPointResult {
@@ -34,6 +35,7 @@ export interface TokenSupportStoreInterface {
   loadAll(): Promise<readonly TokenSupportRecord[]>;
   get(token: string, provider: TokenSupportProvider): Promise<TokenSupportRecord | null>;
   set(token: string, provider: TokenSupportProvider, supported: boolean): Promise<void> | void;
+  setBatch?(records: readonly { token: string; provider: TokenSupportProvider; supported: boolean }[]): Promise<void>;
 }
 
 export interface PriceSyncStoreInterface {
@@ -50,6 +52,8 @@ export interface ArchiveCacheStoreInterface {
   getArchive(key: string, ttlMs?: number): Promise<Uint8Array | null>;
   setArchive(key: string, data: Uint8Array): Promise<void>;
   cleanExpired(ttlMs: number): Promise<void>;
+  deleteArchive?(key: string): Promise<void>;
+  deletePrefix?(prefix: string): Promise<void>;
 }
 
 export interface PriceStorage {

@@ -14,6 +14,7 @@ export class TokenSupportService {
   private readonly binanceBaseUrl: string;
   private readonly gateBaseUrl: string;
   private readonly cache = new Map<string, Map<TokenSupportProvider, boolean>>();
+  private readonly inFlightProbes = new Map<string, Promise<boolean>>();
   private initialized = false;
 
   constructor(
@@ -58,6 +59,7 @@ export class TokenSupportService {
                 }
               ).symbols;
               if (Array.isArray(symbols)) {
+                const records: Array<{ token: string; provider: TokenSupportProvider; supported: boolean }> = [];
                 for (const s of symbols) {
                   if (
                     typeof s.symbol === "string" &&
@@ -67,7 +69,16 @@ export class TokenSupportService {
                   ) {
                     const token = s.symbol.slice(0, -4);
                     this.setMemoryCache(token, "binance", true);
-                    this.store.set(token, "binance", true);
+                    records.push({ token, provider: "binance", supported: true });
+                  }
+                }
+                if (records.length > 0) {
+                  if (this.store.setBatch) {
+                    await this.store.setBatch(records);
+                  } else {
+                    for (const r of records) {
+                      this.store.set(r.token, r.provider, r.supported);
+                    }
                   }
                 }
               }
@@ -89,11 +100,21 @@ export class TokenSupportService {
               timeoutMs: 5000,
             });
             if (res.status === 200 && Array.isArray(res.body)) {
+              const records: Array<{ token: string; provider: TokenSupportProvider; supported: boolean }> = [];
               for (const p of res.body as Array<{ id?: string; trade_status?: string }>) {
                 if (typeof p.id === "string" && p.id.endsWith("_USDT") && p.trade_status === "tradable") {
                   const token = p.id.slice(0, -5);
                   this.setMemoryCache(token, "gate", true);
-                  this.store.set(token, "gate", true);
+                  records.push({ token, provider: "gate", supported: true });
+                }
+              }
+              if (records.length > 0) {
+                if (this.store.setBatch) {
+                  await this.store.setBatch(records);
+                } else {
+                  for (const r of records) {
+                    this.store.set(r.token, r.provider, r.supported);
+                  }
                 }
               }
             }
@@ -130,12 +151,22 @@ export class TokenSupportService {
       return persisted.supported;
     }
 
-    // 3. Probe upstream with 1s timeout
-    if (provider === "binance") {
-      return this.probeBinance(cleanToken, signal);
-    } else {
-      return this.probeGate(cleanToken, signal);
-    }
+    // 3. Probe upstream with 1s timeout and singleflight coalescing
+    const probeKey = `${cleanToken}:${provider}`;
+    const inFlight = this.inFlightProbes.get(probeKey);
+    if (inFlight) return inFlight;
+
+    const probePromise = (provider === "binance"
+      ? this.probeBinance(cleanToken, signal)
+      : this.probeGate(cleanToken, signal)
+    ).finally(() => {
+      if (this.inFlightProbes.get(probeKey) === probePromise) {
+        this.inFlightProbes.delete(probeKey);
+      }
+    });
+
+    this.inFlightProbes.set(probeKey, probePromise);
+    return probePromise;
   }
 
   /**

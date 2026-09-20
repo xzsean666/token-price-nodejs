@@ -7,11 +7,12 @@ export class GateArchiveAdapter implements ArchiveProviderAdapter {
 
   getMonthlyArchiveUrl(symbol: string, interval: string, year: number, month: number): string {
     const clean = symbol.toUpperCase().replace(/[^A-Z0-9]/g, "");
-    const base = clean.endsWith("USDT") ? clean.slice(0, -4) : clean;
+    const base = clean.endsWith("USDT") && clean.length > 4 ? clean.slice(0, -4) : clean;
     const pair = `${base}_USDT`;
+    const cleanInterval = interval.toLowerCase().replace(/[^a-z0-9]/g, "");
     const mm = String(month).padStart(2, "0");
     const yyyymm = `${year}${mm}`;
-    return `https://download.gatedata.org/spot/candlesticks_${interval}/${yyyymm}/${pair}-${yyyymm}.csv.gz`;
+    return `https://download.gatedata.org/spot/candlesticks_${cleanInterval}/${yyyymm}/${pair}-${yyyymm}.csv.gz`;
   }
 
   async parseArchive(rawData: Buffer | Uint8Array, interval: string): Promise<KlinePoint[]> {

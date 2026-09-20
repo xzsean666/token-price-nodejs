@@ -30,4 +30,14 @@ export class TokenSupportStore implements TokenSupportStoreInterface {
       (res as Promise<void>).catch(() => undefined);
     }
   }
+
+  async setBatch(records: readonly { token: string; provider: TokenSupportProvider; supported: boolean }[]): Promise<void> {
+    if (this.store.setBatch) {
+      await this.store.setBatch(records);
+    } else {
+      for (const r of records) {
+        await this.store.set(r.token, r.provider, r.supported);
+      }
+    }
+  }
 }

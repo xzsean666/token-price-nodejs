@@ -95,7 +95,16 @@ export class SqlitePriceStorage implements PriceStorage {
         mkdirSync(dirname(resolve(this.path)), { recursive: true });
       }
 
-      const sqlite = await import("node:sqlite");
+      const sqliteModule = "node:sqlite";
+      let sqlite: any;
+      try {
+        sqlite = await import(/* @vite-ignore */ sqliteModule);
+      } catch (importErr) {
+        throw new Error(
+          `Built-in "node:sqlite" is not available in Node.js ${typeof process !== "undefined" ? process.version : "environment"}. Node.js >= 22.5.0 is required for built-in SQLite, or supply an external database adapter via options.customDb.`,
+          { cause: importErr },
+        );
+      }
       this.db = new sqlite.DatabaseSync(this.path);
       this.db.exec(`PRAGMA busy_timeout=${Math.max(0, Math.trunc(this.busyTimeoutMs))}; PRAGMA foreign_keys=ON;`);
       if (this.path !== ":memory:") {
@@ -201,6 +210,35 @@ export class SqlitePriceStorage implements PriceStorage {
         // Storage might not be ready
       }
     },
+
+    setBatch: async (records: readonly { token: string; provider: TokenSupportProvider; supported: boolean }[]): Promise<void> => {
+      if (records.length === 0) return;
+      const exec = this.getExecutor();
+      const nowIso = new Date().toISOString();
+      const runWork = async (tx: GenericSqlExecutor) => {
+        if (this.db && !this.externalExecutor) {
+          const stmt = this.db.prepare(
+            "INSERT OR REPLACE INTO sdk_token_support (token, provider, supported, updated_at) VALUES (?, ?, ?, ?)",
+          );
+          for (const r of records) {
+            stmt.run(r.token.toUpperCase(), r.provider, r.supported ? 1 : 0, nowIso);
+          }
+        } else {
+          for (const r of records) {
+            await tx.run(
+              "INSERT OR REPLACE INTO sdk_token_support (token, provider, supported, updated_at) VALUES (?, ?, ?, ?)",
+              [r.token.toUpperCase(), r.provider, r.supported ? 1 : 0, nowIso],
+            );
+          }
+        }
+      };
+
+      if (exec.transaction) {
+        await exec.transaction(runWork);
+      } else {
+        await runWork(exec);
+      }
+    },
   };
 
   readonly priceSync: PriceSyncStoreInterface = {
@@ -239,12 +277,22 @@ export class SqlitePriceStorage implements PriceStorage {
             [scopeKey, replaceRange.from, replaceRange.to],
           );
         }
-        for (const pt of points) {
-          const payloadStr = typeof pt.payload === "string" ? pt.payload : JSON.stringify(pt.payload);
-          await tx.run(
+        if (this.db && !this.externalExecutor) {
+          const stmt = this.db.prepare(
             "INSERT OR REPLACE INTO sdk_price_points (scope_key, timestamp, payload) VALUES (?, ?, ?)",
-            [scopeKey, pt.timestamp, payloadStr],
           );
+          for (const pt of points) {
+            const payloadStr = typeof pt.payload === "string" ? pt.payload : JSON.stringify(pt.payload);
+            stmt.run(scopeKey, pt.timestamp, payloadStr);
+          }
+        } else {
+          for (const pt of points) {
+            const payloadStr = typeof pt.payload === "string" ? pt.payload : JSON.stringify(pt.payload);
+            await tx.run(
+              "INSERT OR REPLACE INTO sdk_price_points (scope_key, timestamp, payload) VALUES (?, ?, ?)",
+              [scopeKey, pt.timestamp, payloadStr],
+            );
+          }
         }
       };
 
@@ -270,12 +318,13 @@ export class SqlitePriceStorage implements PriceStorage {
 
     queryPoint: async (params: QueryPointParams): Promise<QueryPointResult | null> => {
       const exec = this.getExecutor();
+      const interval = params.interval ?? "5m";
       const scopeFilter =
         params.scopeKey !== undefined && params.scopeKey !== null
           ? { sql: "scope_key = ?", value: params.scopeKey }
           : params.exchange !== undefined && params.exchange !== null
-          ? { sql: "scope_key = ?", value: `${params.tokenKey}:${params.exchange}:${params.market ?? ""}:${params.quote ?? ""}:5m` }
-          : { sql: "scope_key LIKE ?", value: `${params.tokenKey}:%` };
+          ? { sql: "scope_key = ?", value: `${params.tokenKey}:${params.exchange}:${params.market ?? ""}:${params.quote ?? ""}:${interval}` }
+          : { sql: "scope_key LIKE ? || '%' ESCAPE '\\'", value: `${escapeSqlLike(params.tokenKey)}:` };
 
       const requestedIso = params.timestamp;
       const requestedMs = Date.parse(requestedIso);
@@ -341,7 +390,7 @@ export class SqlitePriceStorage implements PriceStorage {
   };
 
   readonly archiveCache: ArchiveCacheStoreInterface = {
-    getArchive: async (key: string, ttlMs: number = 86_400_000): Promise<Uint8Array | null> => {
+    getArchive: async (key: string, ttlMs: number = 0): Promise<Uint8Array | null> => {
       const exec = this.getExecutor();
       try {
         const row = await exec.get<{ data: Buffer | Uint8Array; updated_at: number }>(
@@ -349,7 +398,7 @@ export class SqlitePriceStorage implements PriceStorage {
           [key],
         );
         if (!row) return null;
-        if (Date.now() - row.updated_at > ttlMs) {
+        if (ttlMs > 0 && Date.now() - row.updated_at > ttlMs) {
           await exec.run("DELETE FROM sdk_kline_archive_cache WHERE cache_key=?", [key]);
           return null;
         }
@@ -380,5 +429,27 @@ export class SqlitePriceStorage implements PriceStorage {
         // Ignore
       }
     },
+
+    deleteArchive: async (key: string): Promise<void> => {
+      const exec = this.getExecutor();
+      try {
+        await exec.run("DELETE FROM sdk_kline_archive_cache WHERE cache_key=?", [key]);
+      } catch {
+        // Ignore
+      }
+    },
+
+    deletePrefix: async (prefix: string): Promise<void> => {
+      const exec = this.getExecutor();
+      try {
+        await exec.run("DELETE FROM sdk_kline_archive_cache WHERE cache_key LIKE ? || '%' ESCAPE '\\'", [escapeSqlLike(prefix)]);
+      } catch {
+        // Ignore
+      }
+    },
   };
+}
+
+function escapeSqlLike(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }

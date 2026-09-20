@@ -38,10 +38,12 @@ export class BinanceAdapter implements TokenPriceProviderAdapter {
 
   constructor(options: BinanceAdapterOptions = {}) {
     this.transport = options.transport ?? new AxiosHttpTransport();
+    const allowInsecure = options.allowInsecureHttp ?? false;
+    const isExplicitConfig = options.baseUrl !== undefined || options.baseUrls !== undefined;
     const configured = options.baseUrls ?? (options.baseUrl ? [options.baseUrl] : BINANCE_SPOT_ENDPOINTS);
     this.baseUrls = Object.freeze(
-      [...new Set(configured.map((value) => normalizeBaseUrl(value, options.allowInsecureHttp ?? false)))].filter(
-        isApprovedEndpoint,
+      [...new Set(configured.map((value) => normalizeBaseUrl(value, allowInsecure)))].filter(
+        (endpoint) => isApprovedEndpoint(endpoint, allowInsecure || isExplicitConfig),
       ),
     );
     if (this.baseUrls.length === 0) throw new Error("Binance endpoint pool is empty.");
@@ -198,11 +200,12 @@ function normalizeBaseUrl(value: string, allowInsecureHttp: boolean): string {
   return value.replace(/\/$/, "");
 }
 
-function isApprovedEndpoint(value: string): boolean {
+function isApprovedEndpoint(value: string, allowLoopback: boolean = false): boolean {
   const hostname = new URL(value).hostname.toLowerCase();
   return (
     hostname === "api.binance.com" ||
     /^api[1-4]\.binance\.com$/.test(hostname) ||
-    hostname === "data-api.binance.vision"
+    hostname === "data-api.binance.vision" ||
+    (allowLoopback && (hostname === "localhost" || hostname === "127.0.0.1"))
   );
 }

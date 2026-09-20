@@ -44,10 +44,10 @@ export class KlineBinaryCodec {
     let endIndex = totalRecords;
 
     if (startMs !== undefined) {
-      startIndex = this.binarySearchLower(view, totalRecords, BigInt(startMs));
+      startIndex = this.binarySearchLower(view, totalRecords, BigInt(Math.trunc(startMs)));
     }
     if (endMs !== undefined) {
-      endIndex = this.binarySearchLower(view, totalRecords, BigInt(endMs));
+      endIndex = this.binarySearchLower(view, totalRecords, BigInt(Math.trunc(endMs)));
     }
 
     const count = Math.max(0, endIndex - startIndex);
@@ -64,6 +64,74 @@ export class KlineBinaryCodec {
     }
 
     return points;
+  }
+
+  /**
+   * Finds a single KlinePoint near targetMs based on direction ("before" | "after" | "nearest")
+   * and optional maxDistanceMs limit using O(log N) binary search on the raw binary buffer.
+   */
+  static findPointAt(
+    data: Uint8Array | ArrayBuffer,
+    targetMs: number,
+    direction: "before" | "after" | "nearest" = "before",
+    maxDistanceMs?: number,
+  ): KlinePoint | null {
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const totalRecords = Math.floor(bytes.byteLength / KLINE_RECORD_SIZE);
+    if (totalRecords === 0) return null;
+
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const targetBig = BigInt(Math.trunc(targetMs));
+    const idx = this.binarySearchLower(view, totalRecords, targetBig);
+
+    let selectedIdx = -1;
+
+    if (direction === "before") {
+      if (idx < totalRecords && view.getBigUint64(idx * KLINE_RECORD_SIZE, true) === targetBig) {
+        selectedIdx = idx;
+      } else if (idx - 1 >= 0) {
+        selectedIdx = idx - 1;
+      }
+    } else if (direction === "after") {
+      if (idx < totalRecords) {
+        selectedIdx = idx;
+      }
+    } else {
+      // "nearest"
+      const beforeIdx =
+        idx < totalRecords && view.getBigUint64(idx * KLINE_RECORD_SIZE, true) === targetBig
+          ? idx
+          : idx - 1 >= 0
+          ? idx - 1
+          : -1;
+      const afterIdx = idx < totalRecords ? idx : -1;
+
+      if (beforeIdx === -1) {
+        selectedIdx = afterIdx;
+      } else if (afterIdx === -1) {
+        selectedIdx = beforeIdx;
+      } else {
+        const diffBefore = Math.abs(Number(view.getBigUint64(beforeIdx * KLINE_RECORD_SIZE, true)) - targetMs);
+        const diffAfter = Math.abs(Number(view.getBigUint64(afterIdx * KLINE_RECORD_SIZE, true)) - targetMs);
+        selectedIdx = diffBefore <= diffAfter ? beforeIdx : afterIdx;
+      }
+    }
+
+    if (selectedIdx === -1 || selectedIdx >= totalRecords) return null;
+
+    const offset = selectedIdx * KLINE_RECORD_SIZE;
+    const timestamp = Number(view.getBigUint64(offset, true));
+    const dist = Math.abs(timestamp - targetMs);
+
+    if (maxDistanceMs !== undefined && maxDistanceMs !== null && dist > maxDistanceMs) {
+      return null;
+    }
+
+    const priceNum = view.getFloat64(offset + 8, true);
+    return {
+      timestamp,
+      priceUsd: formatPrice(priceNum),
+    };
   }
 
   /**

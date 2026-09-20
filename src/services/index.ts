@@ -5,3 +5,4 @@ export * from "./TokenSupportStore";
 export * from "./TokenSupportService";
 export * from "./UnifiedKlineService";
 export * from "./PriceSyncService";
+export * from "./TaskQueue";

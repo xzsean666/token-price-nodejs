@@ -70,4 +70,41 @@ describe("KlineBinaryCodec", () => {
     const empty = KlineBinaryCodec.decode(new Uint8Array(0));
     expect(empty).toEqual([]);
   });
+
+  describe("findPointAt", () => {
+    const points: KlinePoint[] = [
+      { timestamp: 1000 * 60 * 5, priceUsd: "100" }, // 5 min
+      { timestamp: 1000 * 60 * 10, priceUsd: "110" }, // 10 min
+      { timestamp: 1000 * 60 * 15, priceUsd: "120" }, // 15 min
+      { timestamp: 1000 * 60 * 20, priceUsd: "130" }, // 20 min
+    ];
+    const buffer = KlineBinaryCodec.encode(points);
+
+    it("defaults to before and finds exact hit", () => {
+      const pt = KlineBinaryCodec.findPointAt(buffer, 1000 * 60 * 10);
+      expect(pt).toEqual({ timestamp: 1000 * 60 * 10, priceUsd: "110" });
+    });
+
+    it("finds preceding point when timestamp is between candles", () => {
+      // Query at 12 min -> should get 10 min point
+      const pt = KlineBinaryCodec.findPointAt(buffer, 1000 * 60 * 12, "before", 5 * 60 * 1000);
+      expect(pt).toEqual({ timestamp: 1000 * 60 * 10, priceUsd: "110" });
+    });
+
+    it("respects maxDistanceMs and returns null if distance exceeded", () => {
+      // Query at 17 min with maxDistance of 1 min -> 15 min candle is 2 min away (> 1 min)
+      const pt = KlineBinaryCodec.findPointAt(buffer, 1000 * 60 * 17, "before", 60 * 1000);
+      expect(pt).toBeNull();
+    });
+
+    it("supports direction: after and nearest", () => {
+      // Query at 12 min, after -> should get 15 min candle
+      const afterPt = KlineBinaryCodec.findPointAt(buffer, 1000 * 60 * 12, "after");
+      expect(afterPt).toEqual({ timestamp: 1000 * 60 * 15, priceUsd: "120" });
+
+      // Query at 14 min, nearest -> should get 15 min candle (1 min away vs 4 min away)
+      const nearestPt = KlineBinaryCodec.findPointAt(buffer, 1000 * 60 * 14, "nearest");
+      expect(nearestPt).toEqual({ timestamp: 1000 * 60 * 15, priceUsd: "120" });
+    });
+  });
 });

@@ -157,6 +157,30 @@ export class IndexedDbPriceStorage implements PriceStorage {
         }
       });
     },
+
+    setBatch: async (records: readonly { token: string; provider: TokenSupportProvider; supported: boolean }[]): Promise<void> => {
+      if (records.length === 0) return;
+      const db = this.getDb();
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction("token_support", "readwrite");
+          const store = tx.objectStore("token_support");
+          const nowIso = new Date().toISOString();
+          for (const r of records) {
+            store.put({
+              token: r.token.toUpperCase(),
+              provider: r.provider,
+              supported: r.supported ? 1 : 0,
+              updated_at: nowIso,
+            });
+          }
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+        } catch {
+          resolve();
+        }
+      });
+    },
   };
 
   readonly priceSync: PriceSyncStoreInterface = {
@@ -262,7 +286,8 @@ export class IndexedDbPriceStorage implements PriceStorage {
 
     queryPoint: async (params: QueryPointParams): Promise<QueryPointResult | null> => {
       const db = this.getDb();
-      const scopeKey = params.scopeKey ?? (params.exchange ? `${params.tokenKey}:${params.exchange}:${params.market ?? ""}:${params.quote ?? ""}:5m` : null);
+      const interval = params.interval ?? "5m";
+      const scopeKey = params.scopeKey ?? (params.exchange ? `${params.tokenKey}:${params.exchange}:${params.market ?? ""}:${params.quote ?? ""}:${interval}` : null);
       const requestedIso = params.timestamp;
       const requestedMs = Date.parse(requestedIso);
 
@@ -273,10 +298,21 @@ export class IndexedDbPriceStorage implements PriceStorage {
             const store = tx.objectStore("price_points");
             if (scopeKey) {
               const index = store.index("scope_timestamp");
-              const range =
-                direction === "before"
-                  ? IDBKeyRange.bound([scopeKey, ""], [scopeKey, requestedIso])
-                  : IDBKeyRange.bound([scopeKey, requestedIso], [scopeKey, "\uffff"]);
+              let range: IDBKeyRange;
+              if (params.maxDistanceMs !== undefined && Number.isFinite(params.maxDistanceMs)) {
+                if (direction === "before") {
+                  const lowerIso = new Date(Math.max(0, requestedMs - params.maxDistanceMs)).toISOString();
+                  range = IDBKeyRange.bound([scopeKey, lowerIso], [scopeKey, requestedIso]);
+                } else {
+                  const upperIso = new Date(requestedMs + params.maxDistanceMs).toISOString();
+                  range = IDBKeyRange.bound([scopeKey, requestedIso], [scopeKey, upperIso]);
+                }
+              } else {
+                range =
+                  direction === "before"
+                    ? IDBKeyRange.bound([scopeKey, ""], [scopeKey, requestedIso])
+                    : IDBKeyRange.bound([scopeKey, requestedIso], [scopeKey, "\uffff"]);
+              }
               const cursorDir = direction === "before" ? "prev" : "next";
 
               const req = index.openCursor(range, cursorDir);
@@ -290,10 +326,21 @@ export class IndexedDbPriceStorage implements PriceStorage {
               // Prefix search on tokenKey across scopes: search timestamp index
               const index = store.index("timestamp");
               const tokenPrefix = `${params.tokenKey}:`;
-              const range =
-                direction === "before"
-                  ? IDBKeyRange.upperBound(requestedIso)
-                  : IDBKeyRange.lowerBound(requestedIso);
+              let range: IDBKeyRange;
+              if (params.maxDistanceMs !== undefined && Number.isFinite(params.maxDistanceMs)) {
+                if (direction === "before") {
+                  const lowerIso = new Date(Math.max(0, requestedMs - params.maxDistanceMs)).toISOString();
+                  range = IDBKeyRange.bound(lowerIso, requestedIso);
+                } else {
+                  const upperIso = new Date(requestedMs + params.maxDistanceMs).toISOString();
+                  range = IDBKeyRange.bound(requestedIso, upperIso);
+                }
+              } else {
+                range =
+                  direction === "before"
+                    ? IDBKeyRange.upperBound(requestedIso)
+                    : IDBKeyRange.lowerBound(requestedIso);
+              }
               const cursorDir = direction === "before" ? "prev" : "next";
 
               const req = index.openCursor(range, cursorDir);
@@ -376,7 +423,7 @@ export class IndexedDbPriceStorage implements PriceStorage {
   };
 
   readonly archiveCache: ArchiveCacheStoreInterface = {
-    getArchive: async (key: string, ttlMs: number = 86_400_000): Promise<Uint8Array | null> => {
+    getArchive: async (key: string, ttlMs: number = 0): Promise<Uint8Array | null> => {
       const db = this.getDb();
       return new Promise((resolve) => {
         try {
@@ -386,7 +433,7 @@ export class IndexedDbPriceStorage implements PriceStorage {
           req.onsuccess = () => {
             const row = req.result;
             if (!row) return resolve(null);
-            if (Date.now() - row.updated_at > ttlMs) {
+            if (ttlMs > 0 && Date.now() - row.updated_at > ttlMs) {
               const delTx = db.transaction("kline_archive", "readwrite");
               delTx.objectStore("kline_archive").delete(key);
               return resolve(null);
@@ -435,6 +482,36 @@ export class IndexedDbPriceStorage implements PriceStorage {
               cursor.continue();
             }
           };
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+        } catch {
+          resolve();
+        }
+      });
+    },
+
+    deleteArchive: async (key: string): Promise<void> => {
+      const db = this.getDb();
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction("kline_archive", "readwrite");
+          tx.objectStore("kline_archive").delete(key);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => resolve();
+        } catch {
+          resolve();
+        }
+      });
+    },
+
+    deletePrefix: async (prefix: string): Promise<void> => {
+      const db = this.getDb();
+      return new Promise((resolve) => {
+        try {
+          const tx = db.transaction("kline_archive", "readwrite");
+          const store = tx.objectStore("kline_archive");
+          const range = IDBKeyRange.bound(prefix, prefix + "\uffff");
+          store.delete(range);
           tx.oncomplete = () => resolve();
           tx.onerror = () => resolve();
         } catch {

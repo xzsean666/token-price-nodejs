@@ -51,11 +51,16 @@ export class PriceRequestExecutor {
       ((ms: number, signal?: AbortSignal) =>
         new Promise((resolve, reject) => {
           if (signal?.aborted) return reject(new Error("Aborted"));
-          const timer = setTimeout(resolve, ms);
-          signal?.addEventListener("abort", () => {
+          let timer: any;
+          const onAbort = () => {
             clearTimeout(timer);
             reject(new Error("Aborted"));
-          });
+          };
+          timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+          }, ms);
+          signal?.addEventListener("abort", onAbort, { once: true });
         }));
     this.correlationIdFactory = options.correlationIdFactory ?? defaultUuid;
   }

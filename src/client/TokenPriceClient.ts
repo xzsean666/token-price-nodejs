@@ -26,6 +26,7 @@ import type { GateKlineRequest, GateKlinePoint } from "../domain/gateKlineModels
 import { normalizeGateKlineRequest } from "../domain/gateKlineModels";
 import type { TokenSupportProvider, TokenSupportStatusMap } from "../domain/tokenSupportModels";
 import type { PricePointQuery, PriceAtResult, PriceUpdateRequest, PriceUpdateResult, PriceRecollectRequest, PriceSyncScopeRequest } from "../domain/priceSyncModels";
+import { TaskQueue, globalTaskQueue } from "../services/TaskQueue";
 
 export interface TokenPriceClientOptions {
   readonly transport?: HttpTransport | undefined;
@@ -34,6 +35,8 @@ export interface TokenPriceClientOptions {
   readonly priceAdapters?: readonly TokenPriceProviderAdapter[] | undefined;
   readonly cacheDir?: string | undefined;
   readonly timeoutMs?: number | undefined;
+  readonly taskQueue?: TaskQueue | undefined;
+  readonly maxConcurrency?: number | undefined;
 }
 
 export class TokenPriceClient {
@@ -48,11 +51,15 @@ export class TokenPriceClient {
   readonly gateAdapter: GateAdapter;
   readonly router: PriceProviderRouter;
   readonly executor: PriceRequestExecutor;
+  readonly taskQueue: TaskQueue;
   private readonly tokenAliases: Readonly<Record<string, string>>;
 
   constructor(options: TokenPriceClientOptions = {}) {
     const transport = options.transport ?? new AxiosHttpTransport();
     this.tokenAliases = options.tokenAliases ?? {};
+    this.taskQueue =
+      options.taskQueue ??
+      (options.maxConcurrency ? new TaskQueue({ concurrency: options.maxConcurrency }) : globalTaskQueue);
 
     // 1. Storage setup
     if (options.storage && "driver" in options.storage) {
@@ -95,13 +102,14 @@ export class TokenPriceClient {
       cacheDir: options.cacheDir,
       storage: this.storage,
       transport,
+      taskQueue: this.taskQueue,
     });
     this.unifiedKlineService = new UnifiedKlineService(
       this.tokenSupportService,
       this.klineArchiveManager,
       this.binanceAdapter,
       this.gateAdapter,
-      { transport },
+      { transport, taskQueue: this.taskQueue, storage: this.storage },
     );
 
     // 5. Price sync
@@ -114,6 +122,11 @@ export class TokenPriceClient {
       this.binanceAdapter,
       this.tokenAliases,
       dailyAdapters,
+      {
+        unifiedKlineService: this.unifiedKlineService,
+        klineArchiveManager: this.klineArchiveManager,
+        taskQueue: this.taskQueue,
+      },
     );
   }
 
@@ -211,6 +224,20 @@ export class TokenPriceClient {
 
   resetPriceSync(input: PriceSyncScopeRequest): Promise<void> {
     return this.priceSyncService.resetPriceSync(input);
+  }
+
+  /**
+   * Explicitly cleans expired cache files if an explicit TTL is provided or configured.
+   */
+  cleanCache(explicitTtlMs?: number): Promise<void> {
+    return this.klineArchiveManager.cleanExpiredCache(explicitTtlMs);
+  }
+
+  /**
+   * Explicitly clears all cached archive files and archive storage cache.
+   */
+  clearAllCache(): Promise<void> {
+    return this.klineArchiveManager.clearCache();
   }
 }
 

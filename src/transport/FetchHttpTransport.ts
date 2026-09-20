@@ -25,10 +25,12 @@ export class FetchHttpTransport implements HttpTransport {
 
     let signal = req.signal;
     let timeoutId: any;
+    let onAbort: (() => void) | undefined;
     if (req.timeoutMs && req.timeoutMs > 0) {
       const controller = new AbortController();
       if (signal) {
-        signal.addEventListener("abort", () => controller.abort(signal?.reason));
+        onAbort = () => controller.abort(signal?.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
       }
       timeoutId = setTimeout(() => controller.abort(new Error("Timeout")), req.timeoutMs);
       signal = controller.signal;
@@ -82,6 +84,9 @@ export class FetchHttpTransport implements HttpTransport {
       throw tokenPriceError("PROVIDER_UNAVAILABLE", error.message || "Fetch network error.", { cause: error });
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
+      if (req.signal && onAbort) {
+        req.signal.removeEventListener("abort", onAbort);
+      }
     }
   }
 }

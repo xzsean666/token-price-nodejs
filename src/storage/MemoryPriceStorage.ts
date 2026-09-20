@@ -48,6 +48,19 @@ export class MemoryPriceStorage implements PriceStorage {
         updatedAt: new Date().toISOString(),
       });
     },
+
+    setBatch: async (records: readonly { token: string; provider: TokenSupportProvider; supported: boolean }[]): Promise<void> => {
+      const nowIso = new Date().toISOString();
+      for (const r of records) {
+        const key = `${r.token.toUpperCase()}:${r.provider}`;
+        this.tokenSupportMap.set(key, {
+          token: r.token.toUpperCase(),
+          provider: r.provider,
+          supported: r.supported,
+          updatedAt: nowIso,
+        });
+      }
+    },
   };
 
   readonly priceSync: PriceSyncStoreInterface = {
@@ -109,11 +122,20 @@ export class MemoryPriceStorage implements PriceStorage {
     },
 
     queryPoint: async (params: QueryPointParams): Promise<QueryPointResult | null> => {
-      const targetScope = params.scopeKey ?? (params.exchange ? `${params.tokenKey}:${params.exchange}:${params.market ?? ""}:${params.quote ?? ""}:5m` : null);
+      const interval = params.interval ?? "5m";
+      const targetScope = params.scopeKey ?? (params.exchange ? `${params.tokenKey}:${params.exchange}:${params.market ?? ""}:${params.quote ?? ""}:${interval}` : null);
       const requestedIso = params.timestamp;
       const requestedMs = Date.parse(requestedIso);
 
-      const candidatePoints: Array<{ scopeKey: string; timestamp: string; payload: string }> = [];
+      let before: { scopeKey: string; timestamp: string; payload: string } | undefined;
+      let after: { scopeKey: string; timestamp: string; payload: string } | undefined;
+
+      const minTimestamp = params.maxDistanceMs !== undefined && Number.isFinite(params.maxDistanceMs)
+        ? new Date(Math.max(0, requestedMs - params.maxDistanceMs)).toISOString()
+        : null;
+      const maxTimestamp = params.maxDistanceMs !== undefined && Number.isFinite(params.maxDistanceMs)
+        ? new Date(requestedMs + params.maxDistanceMs).toISOString()
+        : null;
 
       for (const [scopeKey, map] of this.pointsMap.entries()) {
         if (targetScope) {
@@ -123,24 +145,18 @@ export class MemoryPriceStorage implements PriceStorage {
         }
 
         for (const [timestamp, payload] of map.entries()) {
-          candidatePoints.push({ scopeKey, timestamp, payload });
-        }
-      }
-
-      if (candidatePoints.length === 0) return null;
-
-      // Sort candidate points by timestamp ascending, then scopeKey
-      candidatePoints.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.scopeKey.localeCompare(b.scopeKey));
-
-      let before: { scopeKey: string; timestamp: string; payload: string } | undefined;
-      let after: { scopeKey: string; timestamp: string; payload: string } | undefined;
-
-      for (const pt of candidatePoints) {
-        if (pt.timestamp <= requestedIso) {
-          before = pt;
-        }
-        if (pt.timestamp >= requestedIso && !after) {
-          after = pt;
+          if (timestamp <= requestedIso) {
+            if (minTimestamp && timestamp < minTimestamp) continue;
+            if (!before || timestamp > before.timestamp || (timestamp === before.timestamp && scopeKey < before.scopeKey)) {
+              before = { scopeKey, timestamp, payload };
+            }
+          }
+          if (timestamp >= requestedIso) {
+            if (maxTimestamp && timestamp > maxTimestamp) continue;
+            if (!after || timestamp < after.timestamp || (timestamp === after.timestamp && scopeKey < after.scopeKey)) {
+              after = { scopeKey, timestamp, payload };
+            }
+          }
         }
       }
 
@@ -187,10 +203,10 @@ export class MemoryPriceStorage implements PriceStorage {
   };
 
   readonly archiveCache: ArchiveCacheStoreInterface = {
-    getArchive: async (key: string, ttlMs: number = 86_400_000): Promise<Uint8Array | null> => {
+    getArchive: async (key: string, ttlMs: number = 0): Promise<Uint8Array | null> => {
       const entry = this.archiveCacheMap.get(key);
       if (!entry) return null;
-      if (Date.now() - entry.updatedAt > ttlMs) {
+      if (ttlMs > 0 && Date.now() - entry.updatedAt > ttlMs) {
         this.archiveCacheMap.delete(key);
         return null;
       }
@@ -205,6 +221,18 @@ export class MemoryPriceStorage implements PriceStorage {
       const cutoff = Date.now() - ttlMs;
       for (const [k, v] of this.archiveCacheMap.entries()) {
         if (v.updatedAt <= cutoff) {
+          this.archiveCacheMap.delete(k);
+        }
+      }
+    },
+
+    deleteArchive: async (key: string): Promise<void> => {
+      this.archiveCacheMap.delete(key);
+    },
+
+    deletePrefix: async (prefix: string): Promise<void> => {
+      for (const k of this.archiveCacheMap.keys()) {
+        if (k.startsWith(prefix)) {
           this.archiveCacheMap.delete(k);
         }
       }

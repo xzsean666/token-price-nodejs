@@ -13,6 +13,10 @@ import { normalizeTokenPriceHistoryRequest } from "../domain/priceOperations";
 import type { PriceStorage, PriceSyncStoreInterface } from "../storage/PriceStorage";
 import { SqlitePriceStorage, type GenericSqlExecutor } from "../storage/SqlitePriceStorage";
 
+import type { UnifiedKlineService } from "./UnifiedKlineService";
+import type { KlineArchiveManager } from "../archive/KlineArchiveManager";
+import { TaskQueue, globalTaskQueue } from "./TaskQueue";
+
 interface PriceRows {
   scope: string;
   tokenKey: string;
@@ -37,14 +41,24 @@ interface ResolvedRange {
   interval: string;
 }
 
+export interface PriceSyncServiceOptions {
+  readonly unifiedKlineService?: UnifiedKlineService | undefined;
+  readonly klineArchiveManager?: KlineArchiveManager | undefined;
+  readonly taskQueue?: TaskQueue | undefined;
+}
+
 export class PriceSyncService {
   private readonly store: PriceSyncStoreInterface;
+  private readonly unifiedKlineService: UnifiedKlineService | null;
+  private readonly klineArchiveManager: KlineArchiveManager | null;
+  private readonly taskQueue: TaskQueue;
 
   constructor(
     storage: PriceStorage | PriceSyncStoreInterface | GenericSqlExecutor,
     private readonly binance: any,
     private readonly aliases: Readonly<Record<string, string>> = {},
     private readonly dailyAdapters: ReadonlyMap<string, TokenPriceProviderAdapter> = new Map(),
+    options: PriceSyncServiceOptions = {},
   ) {
     if ("priceSync" in storage && typeof storage.priceSync === "object") {
       this.store = storage.priceSync;
@@ -54,6 +68,9 @@ export class PriceSyncService {
       const sqliteStorage = SqlitePriceStorage.fromStorageAdapter(storage as GenericSqlExecutor);
       this.store = sqliteStorage.priceSync;
     }
+    this.unifiedKlineService = options.unifiedKlineService ?? null;
+    this.klineArchiveManager = options.klineArchiveManager ?? null;
+    this.taskQueue = options.taskQueue ?? globalTaskQueue;
   }
 
   async update(input: PriceUpdateRequest): Promise<PriceUpdateResult> {
@@ -88,48 +105,139 @@ export class PriceSyncService {
   async getPriceAt(input: PricePointQuery): Promise<PriceAtResult> {
     const requested = parseTimestamp(input.timestamp);
     const scope = this.scope(input);
-    const direction = input.direction ?? input.mode ?? "nearest";
+    const direction = input.direction ?? input.mode ?? "before"; // default: look backwards
+    const maxDistanceMs =
+      input.maxDistanceMs !== undefined
+        ? (input.maxDistanceMs === null ? undefined : Number(input.maxDistanceMs))
+        : 5 * 60 * 1000; // default: 5 minutes
     const tokenKey = this.tokenKey(input.token);
+    const quote = input.quoteCurrency ?? input.quote ?? "USDT";
+    const interval = input.interval ?? "5m";
+    const autoFetch = input.autoFetch ?? true;
 
+    const base = {
+      tokenKey,
+      timestamp: requested.iso,
+      requestedTimestamp: requested.iso,
+      exchange: input.exchange?.toLowerCase() ?? null,
+      market: input.market?.toUpperCase() ?? null,
+      quoteCurrency: quote,
+    };
+
+    // 1. Fast check in store (for manually saved/synced points)
     const point = await this.store.queryPoint({
       tokenKey,
       scopeKey: input.exchange === undefined ? null : scope,
       exchange: input.exchange?.toLowerCase(),
       market: input.market?.toUpperCase(),
-      quote: input.quoteCurrency ?? input.quote,
+      quote,
+      interval,
       timestamp: requested.iso,
       direction,
-      maxDistanceMs: input.maxDistanceMs === undefined ? undefined : Number(input.maxDistanceMs),
+      maxDistanceMs,
     });
 
-    const selected = point === null ? null : parseScope(point.scopeKey);
-    const base = {
-      tokenKey,
-      timestamp: requested.iso,
-      requestedTimestamp: requested.iso,
-      exchange: input.exchange?.toLowerCase() ?? selected?.exchange ?? null,
-      market: input.market?.toUpperCase() ?? selected?.market ?? null,
-      quoteCurrency: input.quoteCurrency ?? input.quote ?? selected?.quote ?? null,
+    if (point) {
+      const distance = Math.abs(parseTimestamp(point.timestamp).ms - requested.ms);
+      if (maxDistanceMs === undefined || distance <= maxDistanceMs) {
+        const rawPoint: any = point.payload;
+        const price = typeof rawPoint === "string" ? rawPoint : rawPoint?.priceUsd ?? rawPoint?.price ?? rawPoint?.close;
+        if (typeof price === "string" && /^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(price)) {
+          const selected = parseScope(point.scopeKey);
+          return {
+            ...base,
+            exchange: base.exchange ?? selected?.exchange ?? null,
+            market: base.market ?? selected?.market ?? null,
+            quoteCurrency: base.quoteCurrency ?? selected?.quote ?? null,
+            status: "priced",
+            state: "priced",
+            price,
+            rawPoint,
+            priceTimestamp: point.timestamp,
+            distanceMs: String(distance),
+          };
+        }
+      }
+    }
+
+    // 2. Not in store: Query formatted Kline data (binary archives / recent Klines) directly without saving duplicate price records
+    if (autoFetch && (this.unifiedKlineService || this.klineArchiveManager)) {
+      try {
+        let klinePt: { timestamp: number; priceUsd: string } | null = null;
+        let resolvedProvider = input.exchange?.toLowerCase() ?? "binance";
+
+        if (this.unifiedKlineService) {
+          const res = await this.unifiedKlineService.getPointAt(
+            input.token,
+            interval,
+            requested.ms,
+            direction,
+            maxDistanceMs,
+            input.exchange?.toLowerCase(),
+            input.signal,
+          );
+          klinePt = res.point;
+          resolvedProvider = res.provider;
+        } else if (this.klineArchiveManager && (resolvedProvider === "binance" || resolvedProvider === "gate")) {
+          klinePt = await this.klineArchiveManager.getPointAt(
+            resolvedProvider as "binance" | "gate",
+            input.token,
+            interval,
+            requested.ms,
+            direction,
+            maxDistanceMs,
+            input.signal,
+          );
+        }
+
+        if (klinePt) {
+          const distance = Math.abs(klinePt.timestamp - requested.ms);
+          const cleanToken = input.token.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+          const market =
+            input.market?.toUpperCase() ??
+            (resolvedProvider === "binance" ? `${cleanToken}${quote.toUpperCase()}` : `${cleanToken}_${quote.toUpperCase()}`);
+
+          return {
+            tokenKey,
+            timestamp: requested.iso,
+            requestedTimestamp: requested.iso,
+            exchange: resolvedProvider,
+            market,
+            quoteCurrency: quote,
+            status: "priced",
+            state: "priced",
+            price: klinePt.priceUsd,
+            rawPoint: klinePt,
+            priceTimestamp: new Date(klinePt.timestamp).toISOString(),
+            distanceMs: String(distance),
+          };
+        }
+      } catch {
+        // Fall through to missing
+      }
+    }
+
+    return {
+      ...base,
+      status: "missing",
+      state: "missing",
+      price: null,
+      priceTimestamp: null,
+      distanceMs: null,
     };
-
-    if (!point) return { ...base, status: "missing", state: "missing", price: null, priceTimestamp: null, distanceMs: null };
-
-    const distance = Math.abs(parseTimestamp(point.timestamp).ms - requested.ms);
-    if (input.maxDistanceMs !== undefined && BigInt(distance) > BigInt(input.maxDistanceMs)) {
-      return { ...base, status: "missing", state: "missing", price: null, priceTimestamp: null, distanceMs: null };
-    }
-
-    const rawPoint: any = point.payload;
-    const price = typeof rawPoint === "string" ? rawPoint : rawPoint?.priceUsd ?? rawPoint?.price ?? rawPoint?.close;
-    if (typeof price !== "string" || !/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(price)) {
-      return { ...base, status: "missing", state: "missing", price: null, priceTimestamp: null, distanceMs: null };
-    }
-
-    return { ...base, status: "priced", state: "priced", price, rawPoint, priceTimestamp: point.timestamp, distanceMs: String(distance) };
   }
 
   async getPricesAt(inputs: readonly PricePointQuery[]): Promise<readonly PriceAtResult[]> {
-    return Promise.all(inputs.map((input) => this.getPriceAt(input)));
+    const results: PriceAtResult[] = new Array(inputs.length);
+    const chunkSize = 50;
+    for (let i = 0; i < inputs.length; i += chunkSize) {
+      const chunk = inputs.slice(i, i + chunkSize);
+      const chunkRes = await Promise.all(chunk.map((item) => this.getPriceAt(item)));
+      for (let j = 0; j < chunkRes.length; j++) {
+        results[i + j] = chunkRes[j]!;
+      }
+    }
+    return results;
   }
 
   private async resolveRange(input: PriceUpdateRequest, explicitRange: boolean): Promise<ResolvedRange> {
@@ -249,8 +357,15 @@ function normalizeToken(token: string): string {
   return normalized;
 }
 
-function parseTimestamp(value: string | Date): { ms: number; iso: string } {
-  const ms = value instanceof Date ? value.getTime() : /^\d+$/.test(value) ? Number(value) : Date.parse(value);
+function parseTimestamp(value: string | number | Date): { ms: number; iso: string } {
+  const ms =
+    value instanceof Date
+      ? value.getTime()
+      : typeof value === "number"
+      ? value
+      : /^\d+$/.test(value)
+      ? Number(value)
+      : Date.parse(value);
   if (!Number.isSafeInteger(ms) || !Number.isFinite(ms)) throw new TokenPriceError({ code: "PRICE_RANGE_INVALID", message: "Invalid price timestamp.", retryable: false });
   return { ms, iso: new Date(ms).toISOString() };
 }

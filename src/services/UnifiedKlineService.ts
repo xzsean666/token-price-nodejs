@@ -1,23 +1,31 @@
 import type { KlinePoint, KlineResult, NormalizedKlineRequest } from "../domain/klineModels";
 import type { TokenSupportService } from "./TokenSupportService";
 import type { KlineArchiveManager } from "../archive/KlineArchiveManager";
+import { KlineBinaryCodec } from "../archive/KlineBinaryCodec";
 import type { BinanceAdapter } from "../providers/binance/BinanceAdapter";
 import type { GateAdapter } from "../providers/gate/GateAdapter";
 import { TokenPriceError } from "../domain/errors";
 import { fetchBinanceFiveMinuteKlines } from "../providers/binance/binanceFiveMinute";
 import type { HttpTransport } from "../transport/HttpTransport";
 import { AxiosHttpTransport } from "../transport/AxiosHttpTransport";
+import type { PriceStorage } from "../storage/PriceStorage";
+import { TaskQueue, globalTaskQueue } from "./TaskQueue";
 
 export interface UnifiedKlineServiceOptions {
   readonly transport?: HttpTransport | undefined;
   readonly gateBaseUrl?: string | undefined;
   readonly binanceBaseUrl?: string | undefined;
+  readonly taskQueue?: TaskQueue | undefined;
+  readonly storage?: PriceStorage | undefined;
 }
 
 export class UnifiedKlineService {
   private readonly transport: HttpTransport;
   private readonly gateBaseUrl: string;
   private readonly binanceBaseUrl: string;
+  private readonly taskQueue: TaskQueue;
+  private readonly storage: PriceStorage | null;
+  private readonly recentBinaryCache = new Map<string, { binary: Uint8Array; expiresAt: number }>();
 
   constructor(
     private readonly tokenSupport: TokenSupportService,
@@ -29,6 +37,8 @@ export class UnifiedKlineService {
     this.transport = options.transport ?? new AxiosHttpTransport();
     this.gateBaseUrl = (options.gateBaseUrl ?? "https://api.gateio.ws").replace(/\/$/, "");
     this.binanceBaseUrl = (options.binanceBaseUrl ?? "https://api.binance.com").replace(/\/$/, "");
+    this.taskQueue = options.taskQueue ?? globalTaskQueue;
+    this.storage = options.storage ?? null;
   }
 
   /**
@@ -56,6 +66,197 @@ export class UnifiedKlineService {
   async getKlinesPrices(request: NormalizedKlineRequest): Promise<readonly KlinePoint[]> {
     const result = await this.getKlines(request);
     return result.points;
+  }
+
+  /**
+   * Directly extracts a single price point near targetMs looking back from formatted Kline data.
+   * If targetMs is in a historical natural month, queries KlineArchiveManager via O(log N) binary search on .bin buffer.
+   * If in the current month, fetches recent Klines, encodes to binary, and performs binary search.
+   */
+  async getPointAt(
+    baseSymbol: string,
+    interval: string = "5m",
+    targetMs: number,
+    direction: "before" | "after" | "nearest" = "before",
+    maxDistanceMs?: number | undefined,
+    preferredExchange?: string | null | undefined,
+    signal?: AbortSignal,
+  ): Promise<{ point: KlinePoint | null; provider: "binance" | "gate" }> {
+    let provider: "binance" | "gate";
+    const lower = preferredExchange?.toLowerCase();
+    if (lower === "binance" || lower === "gate") {
+      provider = lower;
+    } else {
+      try {
+        provider = await this.resolveProvider(baseSymbol, signal);
+      } catch {
+        provider = "binance";
+      }
+    }
+    const now = new Date();
+    const currentMonthStartMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1, 0, 0, 0, 0);
+
+    if (targetMs < currentMonthStartMs) {
+      try {
+        const point = await this.archiveManager.getPointAt(
+          provider,
+          baseSymbol,
+          interval,
+          targetMs,
+          direction,
+          maxDistanceMs,
+          signal,
+        );
+        if (point) {
+          return { point, provider };
+        }
+      } catch (err) {
+        // If targetMs is within recent 30 days, the monthly archive might not yet be published
+        // by the exchange (e.g. early days of a new month). Fall back to REST API below.
+        const thirtyDaysAgo = Date.now() - 30 * 24 * 3600 * 1000;
+        if (targetMs < thirtyDaysAgo) {
+          throw err;
+        }
+      }
+    }
+
+    // Recent range in current natural month (or recent month fallback if archive is not yet published)
+    const cleanSymbol = baseSymbol.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const marketSymbol = provider === "binance" ? `${cleanSymbol}USDT` : `${cleanSymbol}_USDT`;
+
+    const ONE_DAY_MS = 24 * 3600 * 1000;
+    const dayStartMs = Math.floor(targetMs / ONE_DAY_MS) * ONE_DAY_MS;
+    const isPastDay = dayStartMs + ONE_DAY_MS <= Date.now();
+    const dayDate = new Date(dayStartMs).toISOString().slice(0, 10);
+    const dailyKey = `daily/${provider}/${cleanSymbol}/${interval}/${dayDate}`;
+    const queueKey = `recent:${provider}:${cleanSymbol}:${interval}:${dayStartMs}`;
+
+    // 1. Fast path: check in-memory recent binary cache
+    let binary: Uint8Array | null = null;
+    const cached = this.recentBinaryCache.get(queueKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      binary = cached.binary;
+    }
+
+    // 2. Storage path: check persistent daily archive in storage (SQLite / IndexedDB)
+    if (!binary && this.storage) {
+      try {
+        const stored = await this.storage.archiveCache.getArchive(dailyKey);
+        if (stored) {
+          binary = stored;
+          this.recentBinaryCache.set(queueKey, {
+            binary: stored,
+            expiresAt: Date.now() + (isPastDay ? 3600_000 : 60_000),
+          });
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (!binary) {
+      binary = await this.taskQueue.enqueue(queueKey, async () => {
+        // Re-check after acquiring lock/slot
+        const recheck = this.recentBinaryCache.get(queueKey);
+        if (recheck && recheck.expiresAt > Date.now()) {
+          return recheck.binary;
+        }
+
+        if (this.storage) {
+          try {
+            const recheckStored = await this.storage.archiveCache.getArchive(dailyKey);
+            if (recheckStored) {
+              this.recentBinaryCache.set(queueKey, {
+                binary: recheckStored,
+                expiresAt: Date.now() + (isPastDay ? 3600_000 : 60_000),
+              });
+              return recheckStored;
+            }
+          } catch {
+            // Ignore
+          }
+        }
+
+        const startMs = dayStartMs;
+        const endMs = Math.min(Date.now(), dayStartMs + ONE_DAY_MS);
+
+        const recentPoints =
+          provider === "binance"
+            ? await this.fetchRecentBinance(marketSymbol, interval as any, startMs, endMs, signal)
+            : await this.fetchRecentGate(marketSymbol, interval, startMs, endMs, signal);
+
+        const encoded = KlineBinaryCodec.encode(recentPoints);
+
+        // If this day is completed (past day), persist to SQLite daily archive cache!
+        if (isPastDay && this.storage) {
+          try {
+            await this.storage.archiveCache.setArchive(dailyKey, encoded);
+          } catch {
+            // Ignore storage errors
+          }
+        }
+
+        // TTL: 60s for today, 1 hour for past days of current month
+        const ttlMs = isPastDay ? 3600_000 : 60_000;
+        this.recentBinaryCache.set(queueKey, {
+          binary: encoded,
+          expiresAt: Date.now() + ttlMs,
+        });
+
+        // Keep at most 200 day-buffers in memory (~1 MB total)
+        if (this.recentBinaryCache.size > 200) {
+          const firstKey = this.recentBinaryCache.keys().next().value;
+          if (firstKey) this.recentBinaryCache.delete(firstKey);
+        }
+
+        return encoded;
+      });
+    }
+
+    let point = KlineBinaryCodec.findPointAt(binary, targetMs, direction, maxDistanceMs);
+
+    // If not found in current day and target is near boundary, check previous boundary
+    if (!point && (direction === "before" || direction === "nearest")) {
+      const distFromStart = targetMs - currentMonthStartMs;
+      const effectiveMaxDist = maxDistanceMs ?? 5 * 60 * 1000;
+      if (distFromStart >= 0 && distFromStart <= effectiveMaxDist) {
+        try {
+          point = await this.archiveManager.getPointAt(
+            provider,
+            baseSymbol,
+            interval,
+            targetMs,
+            "before",
+            maxDistanceMs,
+            signal,
+          );
+        } catch {
+          // Ignore
+        }
+      } else {
+        const distFromDayStart = targetMs - dayStartMs;
+        if (distFromDayStart >= 0 && distFromDayStart <= effectiveMaxDist && dayStartMs > currentMonthStartMs) {
+          try {
+            const prevRes = await this.getPointAt(
+              baseSymbol,
+              interval,
+              dayStartMs - 1,
+              "before",
+              maxDistanceMs,
+              provider,
+              signal,
+            );
+            if (prevRes.point) {
+              point = prevRes.point;
+            }
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    }
+
+    return { point, provider };
   }
 
   /**
@@ -94,18 +295,34 @@ export class UnifiedKlineService {
 
       for (const [year, month] of months) {
         if (request.signal?.aborted) break;
-        const monthPoints = await this.archiveManager.getMonthlyKlines(
-          provider,
-          baseSymbol,
-          request.interval,
-          year,
-          month,
-          request.startMs,
-          archiveEndMs,
-          request.signal,
-        );
-        for (const p of monthPoints) {
-          pointsMap.set(p.timestamp, p);
+        try {
+          const monthPoints = await this.archiveManager.getMonthlyKlines(
+            provider,
+            baseSymbol,
+            request.interval,
+            year,
+            month,
+            request.startMs,
+            archiveEndMs,
+            request.signal,
+          );
+          for (const p of monthPoints) {
+            pointsMap.set(p.timestamp, p);
+          }
+        } catch (err) {
+          const thirtyDaysAgo = Date.now() - 30 * 24 * 3600 * 1000;
+          if (archiveEndMs >= thirtyDaysAgo) {
+            const fallbackStart = Math.max(request.startMs, thirtyDaysAgo);
+            const fallbackPoints =
+              provider === "binance"
+                ? await this.fetchRecentBinance(marketSymbol, request.interval, fallbackStart, archiveEndMs, request.signal)
+                : await this.fetchRecentGate(marketSymbol, request.interval, fallbackStart, archiveEndMs, request.signal);
+            for (const p of fallbackPoints) {
+              pointsMap.set(p.timestamp, p);
+            }
+          } else {
+            throw err;
+          }
         }
       }
     }
@@ -113,13 +330,42 @@ export class UnifiedKlineService {
     // 2. Recent REST API portion: any range in the current natural month
     if (request.endMs > currentMonthStartMs) {
       const recentStartMs = Math.max(request.startMs, currentMonthStartMs);
-      const recentPoints =
-        provider === "binance"
+      const queueKey = `klines:${provider}:${marketSymbol}:${request.interval}:${recentStartMs}:${request.endMs}`;
+      const recentPoints = await this.taskQueue.enqueue(queueKey, async () => {
+        return provider === "binance"
           ? await this.fetchRecentBinance(marketSymbol, request.interval, recentStartMs, request.endMs, request.signal)
           : await this.fetchRecentGate(marketSymbol, request.interval, recentStartMs, request.endMs, request.signal);
+      });
 
       for (const p of recentPoints) {
         pointsMap.set(p.timestamp, p);
+      }
+
+      // Persist completed past days into SQLite daily archive
+      if (this.storage && recentPoints.length > 0) {
+        const ONE_DAY_MS = 24 * 3600 * 1000;
+        const nowMs = Date.now();
+        const cleanSymbol = baseSymbol.toUpperCase().replace(/[^A-Z0-9]/g, "");
+        const dayBuckets = new Map<string, KlinePoint[]>();
+
+        for (const p of recentPoints) {
+          const dStart = Math.floor(p.timestamp / ONE_DAY_MS) * ONE_DAY_MS;
+          if (dStart + ONE_DAY_MS <= nowMs) {
+            const dayDate = new Date(dStart).toISOString().slice(0, 10);
+            const list = dayBuckets.get(dayDate);
+            if (list) {
+              list.push(p);
+            } else {
+              dayBuckets.set(dayDate, [p]);
+            }
+          }
+        }
+
+        for (const [dayDate, pts] of dayBuckets.entries()) {
+          const dailyKey = `daily/${provider}/${cleanSymbol}/${request.interval}/${dayDate}`;
+          const encoded = KlineBinaryCodec.encode(pts);
+          this.storage.archiveCache.setArchive(dailyKey, encoded).catch(() => {});
+        }
       }
     }
 

@@ -53,7 +53,7 @@ export interface PriceUpdateResult {
 
 export interface PricePointQuery {
   readonly token: string;
-  readonly timestamp: string | Date;
+  readonly timestamp: string | number | Date;
   readonly exchange?: string | undefined;
   readonly market?: string | undefined;
   readonly quote?: string | undefined;
@@ -61,7 +61,9 @@ export interface PricePointQuery {
   readonly interval?: string | undefined;
   readonly direction?: "before" | "after" | "nearest" | undefined;
   readonly mode?: "before" | "after" | "nearest" | undefined;
-  readonly maxDistanceMs?: number | string | undefined;
+  readonly maxDistanceMs?: number | string | bigint | null | undefined;
+  readonly autoFetch?: boolean | undefined;
+  readonly signal?: AbortSignal | undefined;
 }
 
 export interface PriceAtResult {

@@ -6,9 +6,11 @@ export class BinanceArchiveAdapter implements ArchiveProviderAdapter {
   readonly provider = "binance" as const;
 
   getMonthlyArchiveUrl(symbol: string, interval: string, year: number, month: number): string {
-    const pair = symbol.toUpperCase().endsWith("USDT") ? symbol.toUpperCase() : `${symbol.toUpperCase()}USDT`;
+    const clean = symbol.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const pair = clean.endsWith("USDT") ? clean : `${clean}USDT`;
+    const cleanInterval = interval.toLowerCase().replace(/[^a-z0-9]/g, "");
     const mm = String(month).padStart(2, "0");
-    return `https://data.binance.vision/data/spot/monthly/klines/${pair}/${interval}/${pair}-${interval}-${year}-${mm}.zip`;
+    return `https://data.binance.vision/data/spot/monthly/klines/${pair}/${cleanInterval}/${pair}-${cleanInterval}-${year}-${mm}.zip`;
   }
 
   async parseArchive(rawData: Buffer | Uint8Array): Promise<KlinePoint[]> {
