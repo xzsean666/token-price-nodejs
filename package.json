@@ -1,6 +1,6 @@
 {
   "name": "token-price-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Universal, isomorphic CEX & DEX token price SDK for Node.js and Browser — multi-exchange aggregation, monthly kline binary archives, token support checks, and dual-driver storage (SQLite / IndexedDB).",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -22,6 +22,7 @@
     "node": ">=20.0.0"
   },
   "scripts": {
+    "prepare": "tsup",
     "build": "tsup && tsc --project tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
